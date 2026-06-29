@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+torchvision
+timm
+numpy
+scipy
+wfdb
+pydicom
