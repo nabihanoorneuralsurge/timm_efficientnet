@@ -107,7 +107,7 @@ def predict_from_path(
                 )
 
         result = inference.run_prediction(path)
-        return result
+        return {"labels": result["labels"]}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -168,7 +168,7 @@ async def predict_from_upload(
                 )
 
             result = inference.run_prediction(target_file)
-            return result
+            return {"labels": result["labels"]}
 
     except HTTPException:
         raise
