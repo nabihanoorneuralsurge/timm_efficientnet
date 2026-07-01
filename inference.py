@@ -154,16 +154,25 @@ def ensure_samples_by_leads(signal):
     return signal.astype(np.float32)
 
 
-def preprocess_signal_for_timm(signal, target_signal_length=5000, target_image_size=224):
+def preprocess_signal_for_timm(
+    signal,
+    target_signal_length=5000,
+    target_image_size=224,
+    input_sampling_rate=None,
+    target_sampling_rate=500,
+    target_duration_seconds=10
+):
     """
-    Raw ECG -> model input.
+    ECG waveform -> model tensor.
 
-    Input:
-        ECG shape: (samples, 12) or (12, samples)
+    Uses sampling rate if available:
+        input_sampling_rate from .hea / WFDB / DICOM
 
-    Output:
-        Tensor shape: (1, 3, 224, 224)
+    Final model input:
+        10 seconds × 500Hz = 5000 samples
+        then converted to (1, 3, 224, 224)
     """
+
     signal = ensure_samples_by_leads(signal)
 
     signal = np.nan_to_num(
@@ -176,12 +185,43 @@ def preprocess_signal_for_timm(signal, target_signal_length=5000, target_image_s
     original_samples = int(signal.shape[0])
     original_leads = int(signal.shape[1])
 
+    was_duration_adjusted = False
     was_resampled = False
 
-    # For HR 500Hz model, every ECG becomes 5000 samples
-    if signal.shape[0] != target_signal_length:
-        signal = resample(signal, target_signal_length, axis=0)
-        was_resampled = True
+    # --------------------------------------------------------
+    # If sampling rate exists, use it to extract/pad 10 seconds
+    # --------------------------------------------------------
+    if input_sampling_rate is not None:
+        try:
+            input_sampling_rate = float(input_sampling_rate)
+        except Exception:
+            input_sampling_rate = None
+
+    if input_sampling_rate is not None and input_sampling_rate > 0:
+        expected_input_samples = int(input_sampling_rate * target_duration_seconds)
+
+        # Crop or pad to exact 10 seconds according to original FS
+        if signal.shape[0] > expected_input_samples:
+            signal = signal[:expected_input_samples, :]
+            was_duration_adjusted = True
+
+        elif signal.shape[0] < expected_input_samples:
+            pad_len = expected_input_samples - signal.shape[0]
+            signal = np.pad(signal, ((0, pad_len), (0, 0)), mode="constant")
+            was_duration_adjusted = True
+
+        # Now resample from original FS duration to target 5000 samples
+        if signal.shape[0] != target_signal_length:
+            signal = resample(signal, target_signal_length, axis=0)
+            was_resampled = True
+
+    else:
+        # ----------------------------------------------------
+        # Fallback: old behavior, sample-count based
+        # ----------------------------------------------------
+        if signal.shape[0] != target_signal_length:
+            signal = resample(signal, target_signal_length, axis=0)
+            was_resampled = True
 
     # Same normalization as training
     mean = signal.mean(axis=0, keepdims=True)
@@ -227,8 +267,12 @@ def preprocess_signal_for_timm(signal, target_signal_length=5000, target_image_s
     preprocess_info = {
         "original_samples": original_samples,
         "original_leads": original_leads,
+        "input_sampling_rate": input_sampling_rate,
+        "target_sampling_rate": target_sampling_rate,
+        "target_duration_seconds": target_duration_seconds,
         "target_samples": int(target_signal_length),
         "image_size": int(target_image_size),
+        "was_duration_adjusted": was_duration_adjusted,
         "was_resampled": was_resampled,
         "final_input_shape": list(x.shape)
     }
@@ -272,19 +316,113 @@ def load_wfdb_record(path):
 # MAT + HEA LOADER
 # ============================================================
 
+def parse_hea_file(hea_path):
+    hea_path = Path(hea_path)
+
+    empty = {
+        "hea_found": False,
+        "hea_path": str(hea_path),
+        "sampling_rate": None,
+        "num_samples": None,
+        "lead_names": None,
+        "gains": None,
+    }
+
+    if not hea_path.exists():
+        return empty
+
+    with open(hea_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+
+    if not lines:
+        return empty
+
+    first = lines[0].split()
+
+    fs = None
+    num_samples = None
+
+    if len(first) >= 3:
+        try:
+            fs = float(first[2])
+        except Exception:
+            fs = None
+
+    if len(first) >= 4:
+        try:
+            num_samples = int(float(first[3]))
+        except Exception:
+            num_samples = None
+
+    lead_names = []
+    gains = []
+
+    for line in lines[1:]:
+        parts = line.split()
+
+        if len(parts) < 2:
+            continue
+
+        lead_names.append(parts[-1].strip())
+
+        gain = 1.0
+        if len(parts) >= 3:
+            try:
+                gain = float(parts[2].split("/")[0])
+            except Exception:
+                gain = 1.0
+
+        gains.append(gain)
+
+    return {
+        "hea_found": True,
+        "hea_path": str(hea_path),
+        "sampling_rate": fs,
+        "num_samples": num_samples,
+        "lead_names": lead_names,
+        "gains": gains,
+    }
+
+
+def reorder_signal_by_leads(signal, lead_names):
+    signal = ensure_samples_by_leads(signal)
+
+    if not lead_names:
+        return signal, []
+
+    if len(lead_names) != signal.shape[1]:
+        return signal, []
+
+    cleaned_leads = [clean_lead_name(x) for x in lead_names]
+    lead_map = {lead: idx for idx, lead in enumerate(cleaned_leads)}
+
+    ordered = []
+    missing = []
+
+    for lead in STANDARD_LEADS:
+        if lead in lead_map:
+            ordered.append(signal[:, lead_map[lead]])
+        else:
+            missing.append(lead)
+            ordered.append(np.zeros(signal.shape[0], dtype=np.float32))
+
+    signal = np.stack(ordered, axis=1)
+
+    return signal.astype(np.float32), missing
+
+
 def load_mat_record(path):
-    """
-    Supports .mat file with key 'val'.
-    Also supports .hea if matching .mat exists.
-    """
     path = Path(path)
 
     if path.suffix.lower() == ".hea":
+        hea_path = path
         mat_path = path.with_suffix(".mat")
     elif path.suffix.lower() == ".mat":
         mat_path = path
+        hea_path = path.with_suffix(".hea")
     else:
         mat_path = path.with_suffix(".mat")
+        hea_path = path.with_suffix(".hea")
 
     if not mat_path.exists():
         raise FileNotFoundError(f"MAT file not found: {mat_path}")
@@ -297,10 +435,30 @@ def load_mat_record(path):
     signal = mat["val"]
     signal = ensure_samples_by_leads(signal)
 
+    hea_info = parse_hea_file(hea_path)
+
+    missing_leads = []
+
+    if hea_info["hea_found"] and hea_info.get("lead_names"):
+        signal, missing_leads = reorder_signal_by_leads(
+            signal,
+            hea_info["lead_names"]
+        )
+
+    signal = ensure_samples_by_leads(signal)
+
     loader_info = {
-        "loader": "mat",
+        "loader": "mat_with_optional_hea",
         "mat_path": str(mat_path),
-        "shape": list(signal.shape)
+        "hea_path": str(hea_path),
+        "hea_found": hea_info["hea_found"],
+        "shape": list(signal.shape),
+        "sampling_rate": hea_info.get("sampling_rate"),
+        "num_samples_from_hea": hea_info.get("num_samples"),
+        "lead_names_from_hea": hea_info.get("lead_names"),
+        "missing_standard_leads": missing_leads,
+        "used_hea_for_metadata": hea_info["hea_found"],
+        "applied_hea_gain": False
     }
 
     return signal, loader_info
@@ -551,10 +709,18 @@ def run_prediction(file_path):
 
     raw_signal, loader_info = load_any_ecg(file_path)
 
+    input_sampling_rate = (
+        loader_info.get("sampling_rate")
+        or loader_info.get("sampling_frequency")
+    )
+
     x, preprocess_info = preprocess_signal_for_timm(
         signal=raw_signal,
         target_signal_length=signal_length,
-        target_image_size=image_size
+        target_image_size=image_size,
+        input_sampling_rate=input_sampling_rate,
+        target_sampling_rate=500,
+        target_duration_seconds=10
     )
 
     x = x.to(DEVICE)
@@ -599,4 +765,10 @@ def run_prediction(file_path):
         reverse=True
     )
 
-    return {"labels": detected_labels}
+    return {
+        "success": True,
+        "loader_info": loader_info,
+        "preprocess_info": preprocess_info,
+        "labels": detected_labels,
+        "total_detected": len(detected_labels)
+    }

@@ -115,37 +115,65 @@ def predict_from_path(
 
 @app.post("/predict/upload")
 async def predict_from_upload(
-    file: UploadFile = File(...)
+    dcm: UploadFile = File(None),
+    mat: UploadFile = File(None),
+    hea: UploadFile = File(None),
+    dat: UploadFile = File(None)
 ):
-    saved_path = None
+    # Ensure at least one file is uploaded
+    if dcm is None and mat is None and hea is None and dat is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No files uploaded. Please upload a .dcm, .mat, or .hea + .dat files."
+        )
+
     try:
-        suffix = Path(file.filename).suffix.lower()
+        # Create a temporary directory that will be deleted automatically at the end of the context
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir_path = Path(temp_dir)
 
-        if suffix not in [".dcm", ".mat", ".hea", ".dat"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported file type. Use .dcm, .mat, .hea, or .dat"
-            )
+            # Save all files that were uploaded to the temporary directory
+            if dcm is not None:
+                with (temp_dir_path / dcm.filename).open("wb") as buffer:
+                    shutil.copyfileobj(dcm.file, buffer)
+            if mat is not None:
+                with (temp_dir_path / mat.filename).open("wb") as buffer:
+                    shutil.copyfileobj(mat.file, buffer)
+            if hea is not None:
+                with (temp_dir_path / hea.filename).open("wb") as buffer:
+                    shutil.copyfileobj(hea.file, buffer)
+            if dat is not None:
+                with (temp_dir_path / dat.filename).open("wb") as buffer:
+                    shutil.copyfileobj(dat.file, buffer)
 
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            shutil.copyfileobj(file.file, temp_file)
-            saved_path = Path(temp_file.name)
+            # Determine the target entry point file for prediction
+            target_file = None
 
-        result = inference.run_prediction(saved_path)
-        return result
+            if hea is not None:
+                # For both .mat + .hea and .dat + .hea, the .hea file is the primary path.
+                # In inference.py, load_any_ecg will automatically check if .mat or .dat exists
+                # in the same folder and load it accordingly.
+                target_file = temp_dir_path / hea.filename
+            elif mat is not None:
+                # If only .mat is uploaded
+                target_file = temp_dir_path / mat.filename
+            elif dcm is not None:
+                # If only .dcm is uploaded
+                target_file = temp_dir_path / dcm.filename
+            else:
+                # Only dat was uploaded without hea
+                raise HTTPException(
+                    status_code=400,
+                    detail="For WFDB records (.dat), the header file (.hea) must also be uploaded."
+                )
+
+            result = inference.run_prediction(target_file)
+            return result
 
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        if saved_path and saved_path.exists():
-            try:
-                saved_path.unlink()
-            except Exception as e:
-                print(f"Error deleting temporary file {saved_path}: {e}")
 
 
 if __name__ == "__main__":
