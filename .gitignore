@@ -2,14 +2,18 @@
 __pycache__/
 *.py[cod]
 
-# Temporary files
-temp/
-
-# VS Code
-.vscode/
+# Virtual environment
+.venv/
 
 # Environment files
 .env
+
+# Temporary files
+temp/
+uploads/
+
+# VS Code
+.vscode/
 
 # Logs
 *.log
