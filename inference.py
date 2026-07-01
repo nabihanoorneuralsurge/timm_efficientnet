@@ -17,7 +17,7 @@ from scipy.signal import resample
 # CONFIG
 # ============================================================
 
-MODEL_PATH = "timm_efficientnet_b0_imagenet_ecg_multilabel_hr_500hz_best.pth"
+MODEL_PATH = "model/timm_efficientnet_b0_imagenet_ecg_multilabel_hr_500hz_best.pth"
 
 # Forced to CPU as requested
 DEVICE = "cpu"
